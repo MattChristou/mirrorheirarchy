@@ -34,6 +34,7 @@ class RigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp)
+        os.environ["APPDATA"] = self.tmp            # prefs + written-files manifest
         self.arm_file = os.path.join(self.tmp, "L_Arm.lwo")
         with open(self.arm_file, "wb") as fh:
             fh.write(lwo_build.build([lwo_build.hand_layer()]))
@@ -209,6 +210,117 @@ class RigTest(unittest.TestCase):
         lamp = self.s.named("Right_Lamp")
         self.assertEqual(len(self.s.selected), 2)
         self.assert_world_mirror(other, lamp, 0.0)
+
+    # ---------- Update mode ----------
+
+    def update(self, select=None, **kw):
+        return self.run_core(select=select, mode=core.MODE_UPDATE, **kw)
+
+    def test_update_follows_new_animation(self):
+        self.run_core()
+        count = len(self.s.items)
+        r_arm, r_hand = self.s.named("R_Arm"), self.s.named("R_Hand")
+        # Animate the left side further, then update.
+        self.arm.set_local(2.0, (1.5, 1.0, -0.4), (-0.3, 0.6, 0.2))
+        self.hand.set_local(2.0, (0.0, 0.5, 1.0), (0.4, 0.0, -0.6))
+        report = self.update()
+        self.assertEqual(report.warnings, [])
+        self.assertEqual(len(self.s.items), count)          # nothing new
+        self.assertIs(self.s.named("R_Arm"), r_arm)
+        self.assertEqual(report.items, 4)                    # arm, hand, 2 bones
+        for t in (0.0, 1.0, 1.5, 2.0):
+            self.assert_world_mirror(self.arm, r_arm, t)
+            self.assert_world_mirror(self.hand, r_hand, t)
+        self.assertEqual(self.s.selected, [r_arm])
+
+    def test_update_is_repeatable(self):
+        self.run_core()
+        self.update()
+        r_arm = self.s.named("R_Arm")
+        snap = [(k.time, k.value) for k in r_arm.envs["Rotation.H"].keys]
+        self.update()
+        self.assertEqual([(k.time, k.value) for k in r_arm.envs["Rotation.H"].keys], snap)
+
+    def test_update_copies_curve_shape_and_behaviour(self):
+        self.run_core()
+        env = self.arm.envs["Position.X"]
+        env.keys[1].shape, env.keys[1].params = 1, [0.3, 0.4, 0.0, 0.0]
+        env.behave[2] = 3                                     # post: repeat
+        self.update()
+        r = self.s.named("R_Arm").envs["Position.X"]
+        self.assertEqual(r.keys[1].shape, 1)
+        self.assertEqual(r.keys[1].params[:2], [-0.3, -0.4])
+        self.assertEqual(r.behave[2], 3)
+
+    def test_update_bone_rest_and_pivot(self):
+        self.run_core()
+        self.upper.rest_pos, self.upper.rest_rot = [0.3, 0.1, 0.0], [0.2, 0.1, 0.05]
+        self.hand.pivot = [0.5, 0.1, 0.0]
+        self.update()
+        r_upper = [b for b in self.s.items if b.name == "R_Upper"][0]
+        self.assertEqual(r_upper.rest_pos, [-0.3, 0.1, 0.0])
+        self.assertTrue(close(r_upper.rest_rot, (-0.2, 0.1, -0.05)))
+        self.assertEqual(self.s.named("R_Hand").pivot, [-0.5, 0.1, 0.0])
+
+    def _edit_left_mesh(self):
+        layer = lwo_build.hand_layer()
+        layer["points"] = [(p[0] + 0.25, p[1], p[2]) for p in layer["points"]]
+        with open(self.arm_file, "wb") as fh:
+            fh.write(lwo_build.build([layer]))
+
+    def test_update_rewrites_our_mesh_file(self):
+        self.run_core()
+        r_file = os.path.join(self.tmp, "R_Arm.lwo")
+        self._edit_left_mesh()
+        report = self.update()
+        with open(r_file, "rb") as fh, open(self.arm_file, "rb") as src:
+            self.assertEqual(fh.read(), lwo_mirror.mirror_bytes(src.read())[0])
+        self.assertTrue(any("rewritten" in l for l in report.lines))
+        self.assertEqual(self.s.commands.count("ReplaceWithObject " + r_file), 2)
+
+    def test_update_never_touches_an_edited_mesh_file(self):
+        self.run_core()
+        r_file = os.path.join(self.tmp, "R_Arm.lwo")
+        layer = lwo_build.hand_layer()                       # someone edits it
+        layer["points"][0] = (5.0, 5.0, 5.0)
+        mine = lwo_build.build([layer])
+        with open(r_file, "wb") as fh:
+            fh.write(mine)
+        self._edit_left_mesh()
+        report = self.update()
+        with open(r_file, "rb") as fh:
+            self.assertEqual(fh.read(), mine)
+        self.assertTrue(any("left alone" in l for l in report.lines))
+
+    def test_update_needs_the_other_side(self):
+        report = self.update()
+        self.assertTrue(any("no other-side item" in w for w in report.warnings))
+        self.assertEqual(report.created, [])
+        self.assertFalse(any(i.name.startswith("R_") and i.name != "R_Goal"
+                             for i in self.s.items))
+
+    def test_update_skips_unmatched_child(self):
+        self.run_core()
+        extra = self.s.add(lwsdk.LWI_OBJECT, "L_Finger", self.hand, pos=(0, 0, 0.5))
+        report = self.update()
+        self.assertTrue(any("L_Finger" in w and "skipped" in w for w in report.warnings))
+        self.assert_world_mirror(self.hand, self.s.named("R_Hand"), 0.0)
+
+    def test_update_centre_named_child(self):
+        """Children without a side in the name match by the same name."""
+        self.s.add(lwsdk.LWI_OBJECT, "Tip", self.hand, pos=(0.0, 0.2, 0.5))
+        self.run_core()
+        tips = [i for i in self.s.items if mm.base_item_name(i.name) == "Tip"]
+        self.assertEqual(len(tips), 2)
+        orig = tips[0]
+        orig.set_local(0.0, (0.1, 0.3, 0.6), (0.2, 0.0, 0.0))
+        self.update()
+        self.assert_world_mirror(orig, tips[1], 0.0)
+
+    def test_modifier_warning(self):
+        self.arm.envs["Rotation.H"].modifiers = ["LW_Expression"]
+        report = self.run_core()
+        self.assertTrue(any("LW_Expression" in w for w in report.warnings))
 
     def test_nothing_selected(self):
         self.s.selected = []

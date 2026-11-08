@@ -1,27 +1,35 @@
 # -*- coding: utf-8 -*-
-"""MirrorHierarchy core: clone a hierarchy and mirror it across X without
-any negative scale.
+"""MirrorHierarchy core: mirror a hierarchy across X without any negative
+scale - either as new clones, or onto the existing other side.
 
 How (see mirror_math for the maths):
-  1. Clone every item of each selected hierarchy, rebuild the parenting
-     with Parent In Place OFF, so every clone keeps its local values.
-  2. Mesh objects: write a mirrored copy of the object file (points negated
-     in X, polygon winding reversed - lwo_mirror) and ReplaceWithObject.
-  3. Every clone: negate Position.X, Rotation.H, Rotation.B on every key
-     (tangents too), pivot position X, pivot rotation H/B, bone rest
-     position X and rest rotation H/B. That is the local form of the world
-     mirror M.W.M - a plain rotation, so no negative scale anywhere.
-  4. The top item of each hierarchy: if its new parent is not simply the
-     mirror image of its old parent, solve its keys in world space.
-  5. Re-point IK goals / targets / poles / Same-As-Item links at the clones
-     (or at the other side's item by name), rename L <-> R, swap bone
-     weight map names, then check every clone's world position and axes
-     against the expected mirror image.
+  Create mode
+    1. Clone every item of each selected hierarchy, rebuild the parenting
+       with Parent In Place OFF, so every clone keeps its local values.
+    2. Mesh objects: write a mirrored copy of the object file (points
+       negated in X, polygon winding reversed, node-graph map names
+       swapped - lwo_mirror) and ReplaceWithObject.
+  Update mode
+    1. Find the existing other side by name (R_Arm for L_Arm), then its
+       children by name under it.
+    2. Copy the original's motion keys onto it; refresh its mesh file only
+       if this plug-in wrote that file and nobody has edited it since.
+  Both
+    3. Negate Position.X, Rotation.H, Rotation.B on every key (tangents
+       too); pivot position X, pivot rotation H/B, bone rest position X and
+       rest rotation H/B from the original. That is the local form of the
+       world mirror M.W.M - a plain rotation, so no negative scale.
+    4. The top item: if its parent is not simply the mirror image of the
+       original's parent, solve its keys in world space.
+    5. Re-point IK goals / targets / poles / Same-As-Item links, swap bone
+       weight map names, then check every result's world position and axes
+       against the expected mirror image.
 
 NOT a plug-in container: no LightWave version marker, no server record.
 Keep it Python 2.7-parseable.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -32,12 +40,15 @@ import lwo_mirror
 import mirror_math as mm
 
 __author__ = "Matthew Christou"
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 PLUGIN = "MirrorHierarchy"
 
+MODE_CREATE, MODE_UPDATE = 0, 1
+MODE_LABELS = ["Create mirrored clones", "Update the existing other side"]
+
 PLANE_WORLD, PLANE_TOP, PLANE_PARENT = 0, 1, 2
-PLANE_LABELS = ["World (X = 0)", "Top of hierarchy", "Parent of selection"]
+PLANE_LABELS = ["World (YZ plane)", "Top of hierarchy", "Parent of selection"]
 
 PARENT_OTHER_SIDE, PARENT_SAME, PARENT_NONE = 0, 1, 2
 PARENT_LABELS = ["Other side of the original's parent", "The original's parent",
@@ -47,6 +58,7 @@ MESH_MIRRORED, MESH_KEEP = 0, 1
 MESH_LABELS = ["Write a mirrored copy", "Keep the original mesh"]
 
 SETTINGS = {
+    "mode": MODE_CREATE,
     "plane": PLANE_WORLD,
     "parent": PARENT_OTHER_SIDE,
     "rename": 1,
@@ -57,6 +69,8 @@ SETTINGS = {
 
 POSITION_CHANNELS = ("Position.X", "Position.Y", "Position.Z")
 ROTATION_CHANNELS = ("Rotation.H", "Rotation.P", "Rotation.B")
+SCALE_CHANNELS = ("Scale.X", "Scale.Y", "Scale.Z")
+MOTION_CHANNELS = POSITION_CHANNELS + ROTATION_CHANNELS + SCALE_CHANNELS
 
 # World-check tolerances: position relative to the hierarchy's size,
 # axes as a dot-product shortfall (1e-4 ~ 0.8 degrees).
@@ -65,7 +79,7 @@ AXIS_TOL = 1.0e-4
 
 
 # --------------------------------------------------
-# Logging / preferences
+# Logging / preferences / written-files manifest
 # --------------------------------------------------
 
 
@@ -82,31 +96,68 @@ def log_exception(where):
         pass
 
 
-def _prefs_path():
+def _app_dir():
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    return os.path.join(base, PLUGIN, "prefs.json")
+    return os.path.join(base, PLUGIN)
+
+
+def _write_json(name, data):
+    try:
+        folder = _app_dir()
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        with open(os.path.join(folder, name), "w") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+    except Exception:
+        log_exception("write " + name)
+
+
+def _read_json(name):
+    try:
+        with open(os.path.join(_app_dir(), name), "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
 
 
 def load_prefs():
-    try:
-        with open(_prefs_path(), "r") as fh:
-            saved = json.load(fh)
-        for k in SETTINGS:
-            if k in saved and type(saved[k]) is type(SETTINGS[k]):
-                SETTINGS[k] = saved[k]
-    except Exception:
-        pass
+    saved = _read_json("prefs.json")
+    for k in SETTINGS:
+        if k in saved and type(saved[k]) is type(SETTINGS[k]):
+            SETTINGS[k] = saved[k]
 
 
 def save_prefs():
-    try:
-        path = _prefs_path()
-        if not os.path.isdir(os.path.dirname(path)):
-            os.makedirs(os.path.dirname(path))
-        with open(path, "w") as fh:
-            json.dump(SETTINGS, fh, indent=1, sort_keys=True)
-    except Exception:
-        log_exception("save_prefs")
+    _write_json("prefs.json", SETTINGS)
+
+
+# Every object file this plug-in writes is recorded with a hash of what it
+# wrote. Update mode only ever overwrites a file that is in this list AND
+# still has those exact bytes - never someone's hand-made right side, and
+# never a file that was edited after it was mirrored.
+MANIFEST = "written.json"
+
+
+def _norm(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _digest(data):
+    return hashlib.sha1(data).hexdigest()
+
+
+def record_written(path, data):
+    manifest = _read_json(MANIFEST)
+    manifest[_norm(path)] = _digest(data)
+    _write_json(MANIFEST, manifest)
+
+
+def written_and_unchanged(path):
+    want = _read_json(MANIFEST).get(_norm(path))
+    if not want or not os.path.isfile(path):
+        return False
+    with open(path, "rb") as fh:
+        return _digest(fh.read()) == want
 
 
 # --------------------------------------------------
@@ -165,6 +216,14 @@ def all_items(ii):
     return out
 
 
+def owner_object(ii, item):
+    """The object a bone belongs to (walk up past parent bones)."""
+    cur = ii.parent(item)
+    while cur and ii.type(cur) == lwsdk.LWI_BONE:
+        cur = ii.parent(cur)
+    return cur
+
+
 def children(ii, item):
     """Child items, plus (for an object) its bones parented straight to it,
     in case the child list leaves bones out."""
@@ -186,15 +245,8 @@ def children(ii, item):
     return out
 
 
-def owner_object(ii, item):
-    """The object a bone belongs to (walk up past parent bones)."""
-    cur = ii.parent(item)
-    while cur and ii.type(cur) == lwsdk.LWI_BONE:
-        cur = ii.parent(cur)
-    return cur
-
-
-def item_envelopes(item):
+def item_channels(item):
+    """{channel name: (channel, envelope)} for an item's own channels."""
     ii = lwsdk.LWItemInfo()
     ci = lwsdk.LWChannelInfo()
     group = ii.chanGroup(item)
@@ -205,8 +257,31 @@ def item_envelopes(item):
     while chan:
         env = ci.channelEnvelope(chan)
         if env:
-            found[ci.channelName(chan)] = env
+            found[ci.channelName(chan)] = (chan, env)
         chan = ci.nextChannel(group, chan)
+    return found
+
+
+def item_envelopes(item):
+    return dict((n, ce[1]) for n, ce in item_channels(item).items())
+
+
+def channel_modifiers(item, names):
+    """[(channel name, modifier server)] - expressions and other channel
+    modifiers on the given channels. Their output is not mirrored."""
+    ci = lwsdk.LWChannelInfo()
+    found = []
+    for name, (chan, _) in sorted(item_channels(item).items()):
+        if name not in names:
+            continue
+        for idx in range(1, 9):
+            try:
+                server = ci.server(chan, "ChannelHandler", idx)
+            except Exception:
+                server = None
+            if not server:
+                break
+            found.append((name, server))
     return found
 
 
@@ -221,6 +296,44 @@ def env_keys(ef, env):
         out.append(k)
         k = ef.nextKey(env, k)
     return out
+
+
+KEY_ATTRS = ("LWKEY_SHAPE", "LWKEY_TENSION", "LWKEY_CONTINUITY", "LWKEY_BIAS",
+             "LWKEY_PARAM_0", "LWKEY_PARAM_1", "LWKEY_PARAM_2", "LWKEY_PARAM_3")
+BEHAVIOURS = ("LWENVTAG_PREBEHAVE", "LWENVTAG_POSTBEHAVE")
+
+
+def copy_envelope(ef, src, dst, group=None):
+    """Make `dst` an exact copy of `src`: keys with shape, TCB and tangent
+    parameters, and (when the binding allows) pre/post behaviour."""
+    keys = []
+    for k in env_keys(ef, src):
+        attrs = []
+        for name in KEY_ATTRS:
+            tag = getattr(lwsdk, name, None)
+            if tag is None:
+                continue
+            try:
+                attrs.append((tag, key_get(ef, src, k, tag)))
+            except Exception:
+                pass
+        keys.append((float(key_get(ef, src, k, lwsdk.LWKEY_TIME)),
+                     float(key_get(ef, src, k, lwsdk.LWKEY_VALUE)), attrs))
+    for k in env_keys(ef, dst):
+        ef.destroyKey(dst, k)
+    for when, value, attrs in keys:
+        k = ef.createKey(dst, when, value)
+        for tag, v in attrs:
+            if v is not None:
+                ef.keySet(dst, k, tag, v)
+    for name in BEHAVIOURS:
+        tag = getattr(lwsdk, name, None)
+        if tag is None:
+            continue
+        try:
+            ef.egSet(dst, group, tag, int(_unwrap(ef.egGet(src, group, tag))))
+        except Exception:
+            pass
 
 
 def negate_envelope(ef, env):
@@ -262,6 +375,10 @@ def world_axes(ii, item, when):
              for tag in (lwsdk.LWIP_RIGHT, lwsdk.LWIP_UP, lwsdk.LWIP_FORWARD)])
 
 
+def _differs(a, b, tol=1.0e-7):
+    return a is None or b is None or any(abs(x - y) > tol for x, y in zip(a, b))
+
+
 # Which number scale a Layout angle command takes (radians or degrees) is
 # not documented per command, so the first use is checked by reading the
 # value back. Remembered for the session.
@@ -300,10 +417,12 @@ def set_vector_verified(command, values, readback, angles=False):
 
 class Report(object):
 
-    def __init__(self):
+    def __init__(self, mode=MODE_CREATE):
+        self.mode = mode
         self.lines = []
         self.warnings = []
-        self.created = []
+        self.created = []      # top items made (create) or updated (update)
+        self.items = 0         # every item made or updated
 
     def note(self, text):
         self.lines.append(text)
@@ -314,14 +433,15 @@ class Report(object):
         print("%s: WARNING %s" % (PLUGIN, text))
 
     def summary(self):
-        head = "Mirrored %d item(s)." % len(self.created)
+        head = "%s %d item(s)." % ("Updated" if self.mode == MODE_UPDATE else "Mirrored",
+                                   self.items)
         if self.warnings:
             head += " %d warning(s) - see the Python console." % len(self.warnings)
         return head
 
 
 # --------------------------------------------------
-# The run
+# Finding things
 # --------------------------------------------------
 
 
@@ -339,7 +459,7 @@ def gather_roots(ii, selected):
 
 
 def subtree(ii, root):
-    """[(item, parent item)] preorder, read before anything is cloned."""
+    """[(item, parent item)] preorder, read before anything changes."""
     out = []
     stack = [(root, None)]
     while stack:
@@ -351,20 +471,24 @@ def subtree(ii, root):
     return out
 
 
-def find_by_name(ii, name, like):
-    """An existing item named `name`, of the same type as `like` (and the
-    same object, for bones)."""
+def find_by_name(ii, name, like, exclude=()):
+    """An existing item named `name` (or `name (n)`), of the same type as
+    `like` (and the same object, for bones). Exact names win."""
     if not name:
         return None
     want_type = ii.type(like)
     want_owner = key(owner_object(ii, like)) if want_type == lwsdk.LWI_BONE else None
+    loose = None
     for item in all_items(ii):
-        if ii.type(item) != want_type or ii.name(item) != name:
+        if ii.type(item) != want_type or key(item) in exclude:
             continue
         if want_type == lwsdk.LWI_BONE and key(owner_object(ii, item)) != want_owner:
             continue
-        return item
-    return None
+        if ii.name(item) == name:
+            return item
+        if loose is None and mm.base_item_name(ii.name(item)) == name:
+            loose = item
+    return loose
 
 
 def clone_one(ii, item):
@@ -375,9 +499,10 @@ def clone_one(ii, item):
     cmd("Clone 1")
     ii = lwsdk.LWItemInfo()
     new_items = [i for i in all_items(ii) if key(i) not in before]
+    new_keys = set(key(i) for i in new_items)
     chosen = None
     for sel in lwsdk.LWInterfaceInfo().selected_items():
-        if key(sel) in set(key(i) for i in new_items):
+        if key(sel) in new_keys:
             chosen = sel
             break
     if chosen is None:
@@ -420,11 +545,50 @@ def match_extras(ii, item, clone, extras, nodes, mapping):
     return leftovers
 
 
+def match_partners(ii, nodes, root_partner, pairs):
+    """{original key: other-side item} for Update mode, walking down from
+    the root's partner: each original's partner is a child of its parent's
+    partner named as its other side (L_Hand -> R_Hand), or with the same
+    name when the name has no side (Finger1 under R_Hand). Returns
+    (mapping, [originals with no partner])."""
+    mapping = {key(nodes[0][0]): root_partner}
+    used = set([key(root_partner)])
+    originals = set(key(n) for n, _ in nodes)
+    missing = []
+    for node, parent in nodes[1:]:
+        host = mapping.get(key(parent))
+        if host is None:
+            missing.append(node)
+            continue
+        base = mm.base_item_name(ii.name(node))
+        want = mm.mirror_name(base, pairs) or base
+        found = None
+        for kid in children(ii, host):
+            if (key(kid) in used or key(kid) in originals
+                    or ii.type(kid) != ii.type(node)):
+                continue
+            if mm.base_item_name(ii.name(kid)) == want:
+                found = kid
+                break
+        if found is None:
+            missing.append(node)
+            continue
+        mapping[key(node)] = found
+        used.add(key(found))
+    return mapping, missing
+
+
+# --------------------------------------------------
+# The mirror
+# --------------------------------------------------
+
+
 class Mirror(object):
 
     def __init__(self, settings, report):
         self.s = settings
         self.report = report
+        self.update = settings.get("mode", MODE_CREATE) == MODE_UPDATE
         self.pairs = mm.parse_side_names(settings.get("sides", ""))
         self.ef = lwsdk.LWEnvelopeFuncs()
         self.when = lwsdk.LWInterfaceInfo().curTime
@@ -465,48 +629,84 @@ class Mirror(object):
         ii = lwsdk.LWItemInfo()
         nodes = subtree(ii, root)
         orig_parent = ii.parent(root)
-        new_parent = self.new_parent(ii, root)
         plane_item = self.plane_item(ii, root)
-
         mw = mm.mirror_about(world_frame(ii, plane_item, self.when)) if plane_item else mm.MIRROR
         before = dict((key(n), world_axes(ii, n, self.when)) for n, _ in nodes)
 
-        mapping = self.clone_all(nodes)
-        ii = lwsdk.LWItemInfo()
-        root_clone = mapping[key(root)]
-
-        # Parent the top clone.
-        select(root_clone)
-        if new_parent:
-            cmd("ParentItem " + key(new_parent))
+        if self.update:
+            mapping = self.partners(nodes)
+            if mapping is None:
+                return None
+            ii = lwsdk.LWItemInfo()
+            top = mapping[key(root)]
+            new_parent = ii.parent(top)
+            for node, _ in nodes:
+                other = mapping.get(key(node))
+                if other is not None:
+                    self.copy_motion(node, other)
         else:
-            cmd("ParentItem")
+            new_parent = self.new_parent(ii, root)
+            mapping = self.clone_all(nodes)
+            ii = lwsdk.LWItemInfo()
+            top = mapping[key(root)]
+            select(top)
+            if new_parent:
+                cmd("ParentItem " + key(new_parent))
+            else:
+                cmd("ParentItem")
 
         a = (world_frame(ii, new_parent, self.when).inverse() * mw
              * world_frame(ii, orig_parent, self.when))
-        scale = max([1.0] + [abs(c) for n, _ in nodes for c in before[key(n)][0]])
+        scale = max([1.0] + [abs(c) for n, _ in nodes for c in (before[key(n)][0] or [])])
         plain_root = mm.is_plain_mirror(a, scale=scale)
 
         for node, _ in nodes:
-            clone = mapping.get(key(node))
-            if clone is None:
+            other = mapping.get(key(node))
+            if other is None:
                 continue
             if ii.type(node) == lwsdk.LWI_OBJECT and self.s["mesh"] == MESH_MIRRORED:
-                self.mirror_mesh(node, clone)
+                if self.update:
+                    self.update_mesh(node, other)
+                else:
+                    self.mirror_mesh(node, other)
             if key(node) == key(root) and not plain_root:
-                self.solve_root(clone, orig_parent, new_parent, plane_item)
+                self.solve_root(other, orig_parent, new_parent, plane_item)
             else:
-                self.mirror_channels(clone)
-            self.mirror_pivot(node, clone)
+                self.mirror_channels(other)
+            self.mirror_pivot(node, other)
             if ii.type(node) == lwsdk.LWI_BONE:
-                self.mirror_bone(node, clone)
+                self.mirror_bone(node, other)
+            for chan, server in channel_modifiers(node, mm.MIRROR_CHANNELS):
+                self.report.warn("%s: %s has a %s modifier - %s, not mirrored."
+                                 % (ii.name(node), chan, server,
+                                    "kept on the other side" if self.update else "copied"))
 
         self.fix_references(nodes, mapping)
-        self.rename(nodes, mapping)
+        if not self.update:
+            self.rename(nodes, mapping)
         cmd("RefreshNow")
         self.check_world(nodes, mapping, before, mw, scale)
-        self.report.created.append(root_clone)
-        return root_clone
+        self.report.created.append(top)
+        self.report.items += len(mapping)
+        return top
+
+    def partners(self, nodes):
+        ii = lwsdk.LWItemInfo()
+        root = nodes[0][0]
+        originals = set(key(n) for n, _ in nodes)
+        other = mm.mirror_name(ii.name(root), self.pairs)
+        partner = (find_by_name(ii, mm.base_item_name(other), root, exclude=originals)
+                   if other else None)
+        if partner is None:
+            self.report.warn("%s: no other-side item%s to update - use Create mode first."
+                             % (ii.name(root), " named " + other if other else
+                                " (the name has no Left/Right in it)"))
+            return None
+        mapping, missing = match_partners(ii, nodes, partner, self.pairs)
+        for node in missing:
+            self.report.warn("%s: no matching item under %s on the other side - skipped "
+                             "(with anything below it)." % (ii.name(node), ii.name(partner)))
+        return mapping
 
     def clone_all(self, nodes):
         ii = lwsdk.LWItemInfo()
@@ -528,24 +728,36 @@ class Mirror(object):
 
     # ---------- per item ----------
 
-    def mirror_channels(self, clone):
-        envs = item_envelopes(clone)
+    def copy_motion(self, node, other):
+        """Update mode: the other side's motion channels become a copy of
+        the original's, ready for the mirror rule."""
+        ii = lwsdk.LWItemInfo()
+        src = item_envelopes(node)
+        dst = item_envelopes(other)
+        group = ii.chanGroup(other)
+        for name in MOTION_CHANNELS:
+            if name in src and name in dst:
+                copy_envelope(self.ef, src[name], dst[name], group)
+
+    def mirror_channels(self, item):
+        envs = item_envelopes(item)
         for name in mm.MIRROR_CHANNELS:
             env = envs.get(name)
             if env:
                 negate_envelope(self.ef, env)
 
-    def solve_root(self, clone, orig_parent, new_parent, plane_item):
-        """The top clone's new parent is not the mirror image of its old one,
-        so solve L' = A.L.M at each key time (union over position and
-        rotation). Other times follow the keys' own interpolation."""
+    def solve_root(self, item, orig_parent, new_parent, plane_item):
+        """The top item's parent is not the mirror image of the original's
+        parent, so solve L' = A.L.M at each key time (union over position and
+        rotation). Other times follow the keys' own interpolation. `item`
+        holds a copy of the original's keys when this runs."""
         ii = lwsdk.LWItemInfo()
-        envs = item_envelopes(clone)
+        envs = item_envelopes(item)
         names = POSITION_CHANNELS + ROTATION_CHANNELS
         if any(n not in envs for n in names):
             self.report.warn("%s: missing motion channels - used the plain rule."
-                             % ii.name(clone))
-            self.mirror_channels(clone)
+                             % ii.name(item))
+            self.mirror_channels(item)
             return
         times = set()
         for n in names:
@@ -569,103 +781,119 @@ class Mirror(object):
             for n, v in zip(names, values):
                 set_value_at(self.ef, envs[n], t, v, self.tol)
         self.report.note("%s: top item solved in world space at %d key time(s)."
-                         % (ii.name(clone), len(writes)))
+                         % (ii.name(item), len(writes)))
 
-    def mirror_pivot(self, node, clone):
-        """Pivot from the ORIGINAL, set on the clone: ReplaceWithObject may
-        already have given the clone the mirrored file's layer pivot."""
+    def mirror_pivot(self, node, other):
+        """Pivot from the ORIGINAL, set on the result when it differs:
+        ReplaceWithObject may already have given it the mirrored file's
+        layer pivot, and in Update mode it may hold anything."""
         ii = lwsdk.LWItemInfo()
         piv = vec3(ii.param(node, lwsdk.LWIP_PIVOT, self.when))
-        now = vec3(ii.param(clone, lwsdk.LWIP_PIVOT, self.when))
-        if piv and now and any(abs(a - b) > 1.0e-9 for a, b in zip(now, (-piv[0], piv[1], piv[2]))):
-            select(clone)
+        if piv:
             want = [-piv[0], piv[1], piv[2]]
-            ok = set_vector_verified("PivotPosition", want,
-                                     lambda: lwsdk.LWItemInfo().param(clone, lwsdk.LWIP_PIVOT, self.when))
-            if ok is False:
-                self.report.warn("%s: pivot position did not take." % ii.name(clone))
+            if _differs(vec3(ii.param(other, lwsdk.LWIP_PIVOT, self.when)), want):
+                select(other)
+                ok = set_vector_verified(
+                    "PivotPosition", want,
+                    lambda: lwsdk.LWItemInfo().param(other, lwsdk.LWIP_PIVOT, self.when))
+                if ok is False:
+                    self.report.warn("%s: pivot position did not take." % ii.name(other))
         prot = vec3(ii.param(node, lwsdk.LWIP_PIVOT_ROT, self.when))
-        if prot and (abs(prot[0]) > 0.0 or abs(prot[2]) > 0.0):
-            select(clone)
+        if prot:
             want = [-prot[0], prot[1], -prot[2]]
-            ok = set_vector_verified("PivotRotation", want,
-                                     lambda: lwsdk.LWItemInfo().param(clone, lwsdk.LWIP_PIVOT_ROT, self.when),
-                                     angles=True)
-            if ok is False:
-                self.report.warn("%s: pivot rotation did not take." % ii.name(clone))
+            if _differs(vec3(ii.param(other, lwsdk.LWIP_PIVOT_ROT, self.when)), want):
+                select(other)
+                ok = set_vector_verified(
+                    "PivotRotation", want,
+                    lambda: lwsdk.LWItemInfo().param(other, lwsdk.LWIP_PIVOT_ROT, self.when),
+                    angles=True)
+                if ok is False:
+                    self.report.warn("%s: pivot rotation did not take." % ii.name(other))
 
-    def mirror_bone(self, node, clone):
+    def mirror_bone(self, node, other):
         ii = lwsdk.LWItemInfo()
         bi = lwsdk.LWBoneInfo()
-        name = ii.name(clone)
+        name = ii.name(other)
         pos = vec3(bi.restParam(node, lwsdk.LWIP_POSITION))
         rot = vec3(bi.restParam(node, lwsdk.LWIP_ROTATION))
-        select(clone)
-        if pos and abs(pos[0]) > 0.0:
-            ok = set_vector_verified("BoneRestPosition", [-pos[0], pos[1], pos[2]],
-                                     lambda: lwsdk.LWBoneInfo().restParam(clone, lwsdk.LWIP_POSITION))
-            if ok is False:
-                self.report.warn("%s: rest position did not take." % name)
-        if rot and (abs(rot[0]) > 0.0 or abs(rot[2]) > 0.0):
-            ok = set_vector_verified("BoneRestRotation", [-rot[0], rot[1], -rot[2]],
-                                     lambda: lwsdk.LWBoneInfo().restParam(clone, lwsdk.LWIP_ROTATION),
-                                     angles=True)
-            if ok is False:
-                self.report.warn("%s: rest rotation did not take." % name)
+        select(other)
+        if pos:
+            want = [-pos[0], pos[1], pos[2]]
+            if _differs(vec3(bi.restParam(other, lwsdk.LWIP_POSITION)), want):
+                ok = set_vector_verified(
+                    "BoneRestPosition", want,
+                    lambda: lwsdk.LWBoneInfo().restParam(other, lwsdk.LWIP_POSITION))
+                if ok is False:
+                    self.report.warn("%s: rest position did not take." % name)
+        if rot:
+            want = [-rot[0], rot[1], -rot[2]]
+            if _differs(vec3(bi.restParam(other, lwsdk.LWIP_ROTATION)), want):
+                ok = set_vector_verified(
+                    "BoneRestRotation", want,
+                    lambda: lwsdk.LWBoneInfo().restParam(other, lwsdk.LWIP_ROTATION),
+                    angles=True)
+                if ok is False:
+                    self.report.warn("%s: rest rotation did not take." % name)
         if self.s["rename"]:
             wmap = bi.weightMap(node)
-            other = mm.mirror_name(wmap, self.pairs) if wmap else None
-            if other and other != wmap:
-                cmd("BoneWeightMapName " + other)
+            target = mm.mirror_name(wmap, self.pairs) if wmap else None
+            if target and target != bi.weightMap(other):
+                cmd("BoneWeightMapName " + target)
+
+    # ---------- meshes ----------
+
+    def mirrored_bytes(self, path, label):
+        """(bytes, stats) for the mirrored copy of `path`, or (None, None)."""
+        if path not in self.mesh_cache:
+            with open(path, "rb") as fh:
+                data = fh.read()
+            try:
+                out, stats = lwo_mirror.mirror_bytes(data, bool(self.s["rename"]), self.pairs)
+            except lwo_mirror.LwoError as exc:
+                self.report.warn("%s: cannot read %s (%s) - mesh not mirrored."
+                                 % (label, path, exc))
+                out, stats = None, None
+            if stats is not None:
+                stats["symmetric"] = lwo_mirror.is_point_symmetric(data)
+                if stats["unresolved"]:
+                    self.report.warn("%s: %s still mentions %s outside the maps (a surface "
+                                     "or node this plug-in can't edit) - check it."
+                                     % (label, os.path.basename(path),
+                                        ", ".join(stats["unresolved"])))
+            self.mesh_cache[path] = (out, stats)
+        return self.mesh_cache[path]
+
+    def _mesh_source(self, node):
+        oi = lwsdk.LWObjectInfo()
+        if not oi.numPoints(node):
+            return None                                 # a null
+        path = oi.filename(node)
+        if not path or not os.path.isfile(path):
+            self.report.warn("%s has no saved object file - save it first. Its mesh is "
+                             "not mirrored." % lwsdk.LWItemInfo().name(node))
+            return None
+        return path
 
     def mirror_mesh(self, node, clone):
-        oi = lwsdk.LWObjectInfo()
-        ii = lwsdk.LWItemInfo()
-        if not oi.numPoints(node):
-            return                                      # a null
-        path = oi.filename(node)
-        label = ii.name(node)
-        if not path or not os.path.isfile(path):
-            self.report.warn("%s has no saved object file - save it first. Its clone "
-                             "keeps the original mesh (not mirrored)." % label)
+        path = self._mesh_source(node)
+        if not path:
             return
-        if path not in self.mesh_cache:
-            self.mesh_cache[path] = self.write_mirrored(path, label)
-        new_path, layers = self.mesh_cache[path]
-        if not new_path:
+        label = lwsdk.LWItemInfo().name(node)
+        out, stats = self.mirrored_bytes(path, label)
+        if out is None:
             return
-        select(clone)
-        want_points = oi.numPoints(node)
-        if layers <= 1:
-            cmd("ReplaceWithObject " + new_path)
-        else:
-            layer = int(oi.layerLoaded(node) or 1)
-            for n in (layer, layer + 1):
-                cmd("ReplaceObjectLayer %d %s" % (n, new_path))
-                if lwsdk.LWObjectInfo().numPoints(clone) == want_points:
-                    break
-        oi = lwsdk.LWObjectInfo()
-        got = oi.filename(clone) or ""
-        if os.path.normcase(os.path.abspath(got)) != os.path.normcase(os.path.abspath(new_path)):
-            self.report.warn("%s: ReplaceWithObject did not take (clone still uses %s)."
-                             % (label, got or "no file"))
-        elif oi.numPoints(clone) != want_points:
-            self.report.warn("%s: mirrored clone has %d points, the original %d - "
-                             "wrong layer?" % (label, oi.numPoints(clone), want_points))
+        if self.s["reuse_symmetric"] and not stats["renamed"] and stats["symmetric"]:
+            self.report.note("%s is symmetric - the clone keeps %s."
+                             % (label, os.path.basename(path)))
+            return
+        new_path = self.mesh_cache.get(("written", path))
+        if new_path is None:
+            new_path = self.write_new_file(path, out, stats, label)
+            self.mesh_cache[("written", path)] = new_path
+        if new_path:
+            self.replace_mesh(node, clone, new_path, stats["layers"], label)
 
-    def write_mirrored(self, path, label):
-        """(mirrored file path or None to keep the original, layer count)."""
-        with open(path, "rb") as fh:
-            data = fh.read()
-        try:
-            out, stats = lwo_mirror.mirror_bytes(data, bool(self.s["rename"]), self.pairs)
-        except lwo_mirror.LwoError as exc:
-            self.report.warn("%s: cannot read %s (%s) - mesh not mirrored." % (label, path, exc))
-            return None, 0
-        if (self.s["reuse_symmetric"] and not stats["renamed"]
-                and lwo_mirror.is_point_symmetric(data)):
-            self.report.note("%s is symmetric - the clone keeps %s." % (label, os.path.basename(path)))
-            return None, stats["layers"]
+    def write_new_file(self, path, out, stats, label):
         for n, cand in enumerate(mm.mirrored_file_candidates(path, self.pairs)):
             if n > 200:
                 break
@@ -676,12 +904,68 @@ class Mirror(object):
             else:
                 with open(cand, "wb") as fh:
                     fh.write(out)
-            self.report.note("%s -> %s (%d polygons reversed%s)." % (
+            record_written(cand, out)
+            self.report.note("%s -> %s (%d polygons reversed%s%s)." % (
                 os.path.basename(path), os.path.basename(cand), stats["polygons"],
-                ", %d map(s) renamed" % len(stats["renamed"]) if stats["renamed"] else ""))
-            return cand, stats["layers"]
+                ", %d map(s) renamed" % len(stats["renamed"]) if stats["renamed"] else "",
+                ", %d node reference(s)" % stats["node_refs"] if stats["node_refs"] else ""))
+            return cand
         self.report.warn("%s: no free file name for the mirrored copy." % label)
-        return None, stats["layers"]
+        return None
+
+    def update_mesh(self, node, other):
+        """Rewrite the other side's mesh file - only when this plug-in wrote
+        it and it is unchanged since. Never touches a hand-made file."""
+        path = self._mesh_source(node)
+        if not path:
+            return
+        oi = lwsdk.LWObjectInfo()
+        label = lwsdk.LWItemInfo().name(node)
+        target = oi.filename(other) or ""
+        if not target:
+            return
+        if _norm(target) == _norm(path):
+            return            # the other side reuses the (symmetric) original file
+        out, stats = self.mirrored_bytes(path, label)
+        if out is None:
+            return
+        if os.path.isfile(target):
+            with open(target, "rb") as fh:
+                if fh.read() == out:
+                    return                                  # already current
+        if not written_and_unchanged(target):
+            self.report.note("%s: %s was not written by Mirror Hierarchy, or was edited "
+                             "since - mesh left alone." % (label, os.path.basename(target)))
+            return
+        with open(target, "wb") as fh:
+            fh.write(out)
+        record_written(target, out)
+        self.report.note("%s -> %s rewritten (%d polygons reversed)."
+                         % (os.path.basename(path), os.path.basename(target), stats["polygons"]))
+        self.replace_mesh(node, other, target, stats["layers"], label)
+
+    def replace_mesh(self, node, item, new_path, layers, label):
+        oi = lwsdk.LWObjectInfo()
+        want_points = oi.numPoints(node)
+        select(item)
+        if layers <= 1:
+            cmd("ReplaceWithObject " + new_path)
+        else:
+            layer = int(oi.layerLoaded(node) or 1)
+            for n in (layer, layer + 1):
+                cmd("ReplaceObjectLayer %d %s" % (n, new_path))
+                if lwsdk.LWObjectInfo().numPoints(item) == want_points:
+                    break
+        oi = lwsdk.LWObjectInfo()
+        got = oi.filename(item) or ""
+        if _norm(got) != _norm(new_path):
+            self.report.warn("%s: ReplaceWithObject did not take (still uses %s)."
+                             % (label, got or "no file"))
+        elif oi.numPoints(item) != want_points:
+            self.report.warn("%s: mirrored mesh has %d points, the original %d - "
+                             "wrong layer?" % (label, oi.numPoints(item), want_points))
+
+    # ---------- links, names, check ----------
 
     def fix_references(self, nodes, mapping):
         ii = lwsdk.LWItemInfo()
@@ -692,8 +976,8 @@ class Mirror(object):
                  ("RotationItem", lambda n: ii.sameItem(n, lwsdk.LWIP_ROTATION)),
                  ("ScaleItem", lambda n: ii.sameItem(n, lwsdk.LWIP_SCALING))]
         for node, _ in nodes:
-            clone = mapping.get(key(node))
-            if clone is None:
+            other = mapping.get(key(node))
+            if other is None:
                 continue
             for command, getter in links:
                 try:
@@ -704,14 +988,19 @@ class Mirror(object):
                     continue
                 target = mapping.get(key(ref))
                 if target is None:
-                    other = mm.mirror_name(ii.name(ref), self.pairs)
-                    target = find_by_name(ii, other, ref) if other else None
+                    side = mm.mirror_name(ii.name(ref), self.pairs)
+                    target = find_by_name(ii, side, ref) if side else None
                 if target is not None:
-                    select(clone)
-                    cmd("%s %s" % (command, key(target)))
+                    try:
+                        current = getter(other)
+                    except Exception:
+                        current = None
+                    if key(current) != key(target):
+                        select(other)
+                        cmd("%s %s" % (command, key(target)))
                 elif mm.mirror_name(ii.name(ref), self.pairs):
                     self.report.warn("%s: %s still points at %s (no other-side item found)."
-                                     % (ii.name(clone), command, ii.name(ref)))
+                                     % (ii.name(other), command, ii.name(ref)))
 
     def rename(self, nodes, mapping):
         if not self.s["rename"]:
@@ -730,7 +1019,7 @@ class Mirror(object):
                 cmd("Rename " + other)
 
     def check_world(self, nodes, mapping, before, mw, scale):
-        """Each clone's world position and axes against the mirror image of
+        """Each result's world position and axes against the mirror image of
         the original's: pos' = Mw.pos, right' = -Mw.right, up' = Mw.up,
         forward' = Mw.forward. IK, expressions and modifiers can move an
         item away from that legitimately; the report names them."""
@@ -738,11 +1027,11 @@ class Mirror(object):
         bad = []
         worst = 0.0
         for node, _ in nodes:
-            clone = mapping.get(key(node))
-            if clone is None:
+            other = mapping.get(key(node))
+            if other is None:
                 continue
             pos, axes = before[key(node)]
-            gpos, gaxes = world_axes(ii, clone, self.when)
+            gpos, gaxes = world_axes(ii, other, self.when)
             if pos is None or gpos is None or None in axes or None in gaxes:
                 continue
             want_pos = mw.apply(pos)
@@ -753,20 +1042,20 @@ class Mirror(object):
                        for ga, wa in zip(gaxes, want_axes))
             worst = max(worst, perr, aerr)
             if perr > POS_TOL or aerr > AXIS_TOL:
-                bad.append("%s (position %.2g, axes %.2g)" % (ii.name(clone), perr, aerr))
+                bad.append("%s (position %.2g, axes %.2g)" % (ii.name(other), perr, aerr))
         if bad:
-            self.report.warn("%d clone(s) are not the exact mirror image at this frame "
+            self.report.warn("%d item(s) are not the exact mirror image at this frame "
                              "(IK / expressions / modifiers can cause that): %s"
                              % (len(bad), ", ".join(bad)))
         else:
-            self.report.note("World check passed for %d clone(s) (worst %.1g)."
+            self.report.note("World check passed for %d item(s) (worst %.1g)."
                              % (len(mapping), worst))
 
 
 def run(settings=None):
     """Mirror the selected hierarchies. Returns the Report."""
     settings = settings or SETTINGS
-    report = Report()
+    report = Report(settings.get("mode", MODE_CREATE))
     ii = lwsdk.LWItemInfo()
     selected = list(lwsdk.LWInterfaceInfo().selected_items())
     if not selected:

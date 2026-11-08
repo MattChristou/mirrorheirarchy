@@ -21,6 +21,9 @@ The tests below check these. The code guards each one, but say what you saw.
 | A5 | `ParentItem` with no argument unparents the single selected item. | |
 | A6 | `Rename` works on nulls. | |
 | A7 | `LWObjectInfo.layerLoaded()` gives the layer number for `ReplaceObjectLayer`. | Tried n and n+1; checked by point count. |
+| A8 | `ReplaceWithObject` with the item's **own** path reloads the file after it has changed on disk (Update mode). | If not, the file is right but Layout shows the old mesh until the scene is reloaded. |
+| A9 | Popup entries and `text_ctl` lines accept l10n resource tags, as control titles do. | |
+| A10 | `LWEnvelopeFuncs.egGet` / `egSet` copy pre/post behaviour from Python. | Wrapped in try; the keys are still copied. |
 
 ## T1: mesh winding (the main point)
 
@@ -88,6 +91,45 @@ Expect: R_Lower's goal is R_Goal.
 - Mirror `Sym_Head.lwo` on its own, placed at X = 1. Expect: the clone keeps `Sym_Head.lwo` (the console says it's symmetric) and sits at X = -1.
 - Run T1 again. Expect: no `L_Hand_mirror.lwo`, because the identical `R_Hand.lwo` is reused.
 - Put any other file named `R_Hand.lwo` in place and run T1. Expect: that file is left alone, and the copy goes to `L_Hand_mirror.lwo`.
+
+## T9: Update mode (0.2.0)
+
+Start from T2's result (left and right arms).
+
+1. Change L_Arm's animation: move a key and add a key at frame 45.
+2. Select L_Arm, choose Mode **Update the existing other side**, and run.
+
+Expect:
+- No new items appear.
+- R_Arm and R_Hand follow the new animation on every frame, including the new key.
+- The dialog says "Updated items: N".
+- Running Update again changes nothing.
+
+## T10: Update mode and meshes
+
+1. In Modeler, edit `L_Hand.lwo` and save it.
+2. Run Update on L_Hand.
+
+Expect: the console says "R_Hand.lwo rewritten", and R_Hand in Layout shows the edit, mirrored (A8).
+
+3. Now edit `R_Hand.lwo` in Modeler, save it, and run Update again.
+
+Expect: the console says "R_Hand.lwo … was edited since - mesh left alone", and your edit survives.
+
+## T11: weight map used in a surface
+
+1. Give L_Hand's surface a Weight Map node set to map `L_Hand`, wired into something visible (for example Color through a Mixer).
+2. Save the object, delete the old R_Hand, and mirror with Create.
+
+Expect: R_Hand's surface Weight Map node shows `R_Hand` and the effect renders the same, mirrored.
+
+## T12: Japanese UI
+
+1. Copy `l10n/jp/MirrorHierarchy.resource` to `<LightWave>/support/l10n/jp/`.
+2. Switch Layout's language to Japanese and restart.
+3. Open the panel.
+
+Expect: labels, popup entries, the note lines and the result dialog are all in Japanese (A9). Report any that stay in English or show raw `(k:...` text. Without the file, everything shows in English.
 
 ## T8: your own rig
 

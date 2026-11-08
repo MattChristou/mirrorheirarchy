@@ -26,7 +26,7 @@ Special cases:
 
 ## Install
 
-In Layout, use Utilities › Add Plugins and add `plugin/MirrorHierarchy.py`. Keep the other three files in `plugin/` beside it. They're helper modules that LightWave skips because they have no version marker.
+In Layout, use Utilities › Add Plugins and add `plugin/MirrorHierarchy.py`. Keep the other three files in `plugin/` beside it. They're helper modules that LightWave skips because they have no version marker. For another language, also copy the matching `l10n` file (see Languages).
 
 Two commands appear under Utilities › Python:
 
@@ -39,7 +39,8 @@ Save the scene first. The operation is many Layout commands and can't be undone 
 
 | Setting | |
 |---|---|
-| Mirror across | World X = 0; the top item of the hierarchy (its YZ plane); or the selection's parent. |
+| Mode | **Create mirrored clones**, or **Update the existing other side** (see below). |
+| Mirror across | World (the YZ plane at X = 0); the top item of the hierarchy (its YZ plane); or the selection's parent. |
 | Parent clone to | The other side of the original's parent, found by name (falls back to the original's parent); the original's parent; or nothing (a bone goes to its object). |
 | Meshes | Write a mirrored copy, or keep the original mesh. |
 | Keep file if symmetric | A mesh symmetric about its own X = 0, with no left/right map names, keeps its file. |
@@ -52,6 +53,33 @@ Mirrored files go next to the original:
 - An existing file is never overwritten unless it's byte-identical to the new copy.
 - Mesh objects are named after their file. Nulls, lights, cameras and bones are renamed.
 
+## Update mode
+
+Build the left side, mirror it once with **Create**, then keep working on the left. Select the left top item again and run with **Update the existing other side**:
+
+- **Finding the other side.** The top item's partner is found by name (`L_Arm` → `R_Arm`). Each child is matched under its parent's partner, by its other-side name, or by the same name when the name has no side (`Finger1`).
+- **Animation.** The partner's motion channels become a copy of the original's keys, with curve shapes, tangents and pre/post behaviour, and then get the mirror rule. Keys the right side had are replaced.
+- **Pivots, bone rests, bone weight-map names and IK / Same-As-Item links** are set from the left side.
+- **Meshes.** The right side's object file is rewritten **only** if this plug-in wrote it and it hasn't changed since. A hand-made or edited right-side mesh is left alone, and the console says so. Files the plug-in has written are recorded with a hash in `%APPDATA%\MirrorHierarchy\written.json`.
+- **Nothing is created or renamed.** Items with no match on the other side are skipped and listed.
+
+## Map names inside surfaces
+
+When the mirrored file renames a weight map (`L_Hand` → `R_Hand`), LWO3 surface node graphs that use it follow the rename. That covers, for example, a Weight Map node's map name (`NDTA/NAME`). Node names and connections are never touched, even when a node happens to share a map's name.
+
+If a renamed name still turns up somewhere the plug-in can't edit safely (an LWO2 surface, or a third-party node that doesn't store its data as IFF), the console names it so you can check it. Expressions and other channel modifiers on mirrored channels are reported the same way, because their output isn't mirrored.
+
+## Languages
+
+Everything shown in Layout (panel, popups, dialogs) uses LightWave's l10n resource tags, context `MirrorHierarchy`. Console messages stay in English, because the console would print the raw tags.
+
+- To translate: copy `l10n/<locale>/MirrorHierarchy.resource` into `<LightWave>/support/l10n/<locale>/`.
+- Japanese is in `l10n/jp/`. It's a machine draft; a native speaker should review it.
+- `l10n/MirrorHierarchy.resource` is the English key list to start other languages from. LightWave's locale codes are `de`, `en_GB`, `sp`, `fr`, `it`, `jp`, `ko`, `ru`, `sw` and `zh_Hans`.
+- Without a resource file, the English key text is shown.
+
+A test checks that every tagged string has an entry in every language file.
+
 ## What the mirrored object file gets
 
 | Chunk | Change |
@@ -63,6 +91,7 @@ Mirrored files go next to the original:
 | WGHT, MORF, SPOT, PICK names | Left ↔ right |
 | BBOX | X bounds negated and swapped |
 | LAYR pivot | X negated |
+| Surface node graphs (LWO3) | References to renamed maps follow the rename |
 
 Everything else is copied byte for byte: surfaces and node graphs, image clips, envelopes, and unknown chunks. Point and polygon order never change. LWO2 and LWO3 are both handled.
 
@@ -93,5 +122,6 @@ Always pass `-B`: a stray `.pyc` in `plugin/` would be scanned by LightWave, and
 | `tests/test_lwo_mirror.py` | Geometry, winding (mirrored normals), vmaps, renames, 4-byte indices, multi-layer files. It also mirrors every real object in `../LWOFix/tests/seeds` twice and expects the file back byte for byte. |
 | `tests/test_core.py` | End to end against `tests/fake_layout.py`, a model of Layout built on stated assumptions. Layout itself is checked by hand with [TESTING.md](TESTING.md). |
 | `tests/test_plugin_files.py` | Plug-in container rules: version marker only in the entry file, parses under LightWave's Python 2.7. |
+| `tests/test_l10n.py` | Every tagged string is in every resource file; keys are legal; file header and encoding |
 
 `tools/make_test_objects.py` writes the Layout test objects to `C:/tmp/MirrorHierarchy`.
