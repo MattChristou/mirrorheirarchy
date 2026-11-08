@@ -41,6 +41,7 @@ lwsdk.LWIP_PIVOT_ROT = 12
 lwsdk.LWGENF_PARENTINPLACE = 1 << 6
 lwsdk.AFUNC_OK = 0
 lwsdk.IGeneric = object
+lwsdk.LWENVTAG_PREBEHAVE, lwsdk.LWENVTAG_POSTBEHAVE = 1, 2
 
 CHANNELS = ["Position.X", "Position.Y", "Position.Z",
             "Rotation.H", "Rotation.P", "Rotation.B",
@@ -56,9 +57,14 @@ class Key(object):
 class Env(object):
     def __init__(self, keys):
         self.keys = sorted(keys, key=lambda k: k.time)
+        self.behave = {1: 1, 2: 1}               # pre / post: constant
+        self.modifiers = []                      # channel modifier servers
 
     def copy(self):
-        return Env([Key(k.time, k.value, k.shape, k.params) for k in self.keys])
+        e = Env([Key(k.time, k.value, k.shape, k.params) for k in self.keys])
+        e.behave = dict(self.behave)
+        e.modifiers = list(self.modifiers)
+        return e
 
     def evaluate(self, t):
         ks = self.keys
@@ -310,6 +316,10 @@ class LWChannelInfo(object):
     def channelEnvelope(self, chan):
         return chan[0].envs[chan[1]]
 
+    def server(self, chan, cls, idx):
+        mods = chan[0].envs[chan[1]].modifiers
+        return mods[idx - 1] if cls == "ChannelHandler" and 0 < idx <= len(mods) else None
+
 
 class LWEnvelopeFuncs(object):
     def nextKey(self, env, prev):
@@ -336,6 +346,15 @@ class LWEnvelopeFuncs(object):
             k.shape = value
         else:
             k.params[tag - lwsdk.LWKEY_PARAM_0] = value
+
+    def destroyKey(self, env, k):
+        env.keys.remove(k)
+
+    def egGet(self, env, group, tag):
+        return (1, env.behave[tag])
+
+    def egSet(self, env, group, tag, value):
+        env.behave[tag] = value
 
     def createKey(self, env, t, value):
         k = Key(t, value)

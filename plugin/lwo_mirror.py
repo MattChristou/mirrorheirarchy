@@ -17,6 +17,11 @@ What changes:
                   names are kept.
     BBOX          negate and swap the X bounds
     LAYR          negate the pivot's X
+    FORM (SURF..) LWO3 node graphs: a leaf chunk holding exactly one of the
+                  renamed map names (e.g. a Weight Map node's NDTA/NAME) is
+                  renamed to match; node identity chunks (NNME, IINN, ...)
+                  never are. Any renamed name still found elsewhere is
+                  listed in stats['unresolved'] (e.g. LWO2 surfaces).
 
 Point and polygon order never change, so every PTAG / VMAP / VMAD index
 stays valid.
@@ -40,6 +45,11 @@ except ImportError:                                   # run as a script
 REVERSE_POLY_TYPES = (b"FACE", b"PTCH", b"SUBD")
 NEGATE_X_VMAPS = (b"MORF", b"SPOT", b"NORM")
 RENAME_VMAPS = (b"WGHT", b"MORF", b"SPOT", b"PICK")
+
+# Node-graph chunks that name NODES (or surfaces), not maps: never renamed,
+# or connections (IINN refers to NNME) would break.
+NODE_ID_CHUNKS = (b"NSRV", b"NRNM", b"NNME", b"IINN", b"IONM", b"INME", b"OINN",
+                  b"ONME", b"NPRW", b"    ")
 
 
 class LwoError(Exception):
@@ -215,12 +225,84 @@ def mirror_vmap(payload, discontinuous, rename, pairs, stats):
     return buf
 
 
+def _leaf_string(payload):
+    """The raw string when `payload` is exactly one S0 (padded to even, or
+    not), else None."""
+    p = bytes(payload)
+    end = p.find(b"\0")
+    if end <= 0:
+        return None
+    if len(p) not in (end + 1, end + 2) or p[end:].strip(b"\0"):
+        return None
+    return p[:end]
+
+
+def rename_in_tree(payload, renames, stats):
+    """Rename map references inside a FORM's contents (after its type ID).
+    Returns the new contents, or None when nothing changed or the contents
+    do not walk as IFF (then they are left exactly as they were)."""
+    buf = bytearray(payload)
+    parts = []
+    changed = False
+    off = 0
+    while off < len(buf):
+        if off + 8 > len(buf):
+            return None
+        cid = bytes(buf[off:off + 4])
+        size = _u4(buf, off + 4)
+        end = off + 8 + size
+        if end > len(buf):
+            return None
+        body = buf[off + 8:end]
+        new_body = None
+        if cid == b"FORM" and size >= 4:
+            inner = rename_in_tree(body[4:], renames, stats)
+            if inner is not None:
+                new_body = body[0:4] + inner
+        elif cid not in NODE_ID_CHUNKS:
+            name = _leaf_string(body)
+            if name is not None and name in renames:
+                new_body = write_s0(renames[name])
+                stats["node_refs"] += 1
+        if new_body is not None:
+            changed = True
+            parts.append((cid, new_body))
+        else:
+            parts.append((cid, body))
+        off = end + (size & 1)
+    if not changed:
+        return None
+    out = bytearray()
+    for cid, body in parts:
+        out += bytearray(cid) + bytearray(struct.pack(">I", len(body))) + body
+        if len(body) & 1:
+            out += bytearray(b"\0")
+    return out
+
+
+def _mentions(payload, name):
+    """`name` as a whole NUL-terminated string somewhere in `payload`."""
+    p = bytes(payload)
+    needle = name + b"\0"
+    start = 0
+    while True:
+        i = p.find(needle, start)
+        if i < 0:
+            return False
+        if i == 0 or not (p[i - 1:i].isalnum() or p[i - 1:i] in (b"_", b".", b"-")):
+            return True
+        start = i + 1
+
+
 def mirror_bytes(data, rename=True, pairs=None):
     """(mirrored file bytes, stats). stats: points, polygons (reversed),
-    vmaps_negated, renamed [(old, new)], layers, form."""
+    vmaps_negated, renamed [(old, new)], node_refs (node-graph references
+    renamed), unresolved [names still mentioned outside the maps], layers,
+    form."""
     form, chunks = split_chunks(data)
     stats = {"points": 0, "polygons": 0, "vmaps_negated": 0, "renamed": [],
-             "layers": 0, "form": form.decode("ascii")}
+             "node_refs": 0, "unresolved": [], "layers": 0,
+             "form": form.decode("ascii")}
     out = []
     for cid, payload in chunks:
         if cid == b"PNTS":
@@ -238,6 +320,23 @@ def mirror_bytes(data, rename=True, pairs=None):
             stats["layers"] += 1
             payload = mirror_layr(payload)
         out.append((cid, payload))
+    if stats["renamed"]:
+        renames = dict((old.encode("utf-8"), new.encode("utf-8"))
+                       for old, new in stats["renamed"])
+        for i, (cid, payload) in enumerate(out):
+            if cid == b"FORM" and len(payload) >= 4:
+                inner = rename_in_tree(payload[4:], renames, stats)
+                if inner is not None:
+                    out[i] = (cid, payload[0:4] + inner)
+        # A name that is also some other map's NEW name (L <-> R swaps) can't
+        # be told apart, so only check the rest.
+        targets = set(renames.values())
+        for old in sorted(renames):
+            if old in targets:
+                continue
+            if any(cid not in (b"VMAP", b"VMAD") and _mentions(payload, old)
+                   for cid, payload in out):
+                stats["unresolved"].append(old.decode("utf-8", "replace"))
     return join_chunks(form, out), stats
 
 

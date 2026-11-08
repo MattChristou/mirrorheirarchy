@@ -16,6 +16,8 @@ import lwo_build  # noqa: E402
 import lwo_mirror  # noqa: E402
 
 # Real LW-saved objects (LWO2 and LWO3), if the LWOFix checkout is beside us.
+CAR = os.path.normpath(os.path.join(HERE, "..", "..", "..", "Extensions", "Inertia_plus",
+                                    "Inertia_plus", "Sample", "objects", "car_inertia_plus.lwo"))
 SEEDS = sorted(glob.glob(os.path.join(HERE, "..", "..", "LWOFix", "tests", "seeds", "*.lwo")))
 
 
@@ -170,6 +172,97 @@ class SyntheticTests(unittest.TestCase):
         self.assertEqual(lwo_mirror.main([src, dst]), 0)
         with open(dst, "rb") as fh:
             self.assertEqual(fh.read(), self.out)
+
+
+def _chunk(cid, body):
+    out = cid + struct.pack(">I", len(body)) + body
+    return out + (b"\0" if len(body) & 1 else b"")
+
+
+def _form(ftype, *kids):
+    return _chunk(b"FORM", ftype + b"".join(kids))
+
+
+def _s0(text):
+    raw = text.encode("utf-8") + b"\0"
+    return raw + (b"\0" if len(raw) & 1 else b"")
+
+
+def node_surface(map_name, node_name="Weight Map (1)"):
+    """A minimal LWO3 SURF FORM shaped like LightWave's: a Weight Map node
+    whose NDTA/NAME holds the map name, connected by node name."""
+    ntag = _form(b"NTAG", _chunk(b"NRNM", _s0("Weight Map")), _chunk(b"NNME", _s0(node_name)),
+                 _form(b"NDTA", _chunk(b"NAME", _s0(map_name))))
+    nnds = _form(b"NNDS", _chunk(b"NSRV", _s0("Weight Map")), ntag)
+    ncon = _form(b"NCON", _chunk(b"IINN", _s0(node_name)))
+    return _form(b"SURF", _chunk(b"    ", _s0("Skin") + _s0("")), _form(b"NODS", nnds, ncon))
+
+
+class NodeGraphTests(unittest.TestCase):
+
+    def build(self, surface_chunk, form=b"LWO3"):
+        layer = lwo_build.hand_layer()
+        return lwo_build.build([layer], surface_form=False, form=form, tail=surface_chunk)
+
+    def test_weight_map_node_follows_rename(self):
+        src = self.build(node_surface("L_Hand"))
+        out, stats = lwo_mirror.mirror_bytes(src)
+        self.assertEqual(stats["node_refs"], 1)
+        self.assertEqual(stats["unresolved"], [])
+        self.assertIn(_chunk(b"NAME", _s0("R_Hand")), out)
+        self.assertNotIn(_chunk(b"NAME", _s0("L_Hand")), out)
+        # Sizes all re-walk, and a second mirror gives the file back.
+        self.assertEqual(lwo_mirror.mirror_bytes(out)[0], src)
+
+    def test_node_names_never_renamed(self):
+        """A node the user named like a map keeps its name, and so does the
+        connection that refers to it."""
+        src = self.build(node_surface("L_Hand", node_name="L_Hand"))
+        out, stats = lwo_mirror.mirror_bytes(src)
+        self.assertIn(_chunk(b"NNME", _s0("L_Hand")), out)
+        self.assertIn(_chunk(b"IINN", _s0("L_Hand")), out)
+        self.assertIn(_chunk(b"NAME", _s0("R_Hand")), out)
+
+    def test_length_change_fixes_every_enclosing_size(self):
+        layer = lwo_build.hand_layer()
+        layer["vmaps"] = [(b"WGHT", "Left_Arm", 1, {0: (1.0,)})]
+        src = lwo_build.build([layer], surface_form=False, tail=node_surface("Left_Arm"))
+        out, stats = lwo_mirror.mirror_bytes(src)
+        self.assertEqual(stats["node_refs"], 1)
+        _, chunks = lwo_mirror.split_chunks(out)           # top level walks
+        surf = [p for c, p in chunks if c == b"FORM"][0]
+        self.assertIsNone(lwo_mirror.rename_in_tree(surf[4:], {b"x": b"y"}, {"node_refs": 0}))
+        self.assertIn(_chunk(b"NAME", _s0("Right_Arm")), out)
+
+    def test_unresolved_reference_is_reported(self):
+        """An LWO2-style SURF chunk (not a FORM) mentioning the map can't be
+        edited safely - it is reported instead."""
+        legacy = _chunk(b"SURF", _s0("Skin") + _s0("") + b"VMAP" + struct.pack(">H", 8)
+                        + _s0("L_Hand"))
+        out, stats = lwo_mirror.mirror_bytes(self.build(legacy, form=b"LWO2"))
+        self.assertEqual(stats["unresolved"], ["L_Hand"])
+
+    def test_swapped_pair_not_reported(self):
+        layer = lwo_build.hand_layer()
+        layer["vmaps"] = [(b"WGHT", "L_Hand", 1, {0: (1.0,)}),
+                          (b"WGHT", "R_Hand", 1, {1: (1.0,)})]
+        src = lwo_build.build([layer], surface_form=False, tail=node_surface("L_Hand"))
+        out, stats = lwo_mirror.mirror_bytes(src)
+        self.assertEqual(stats["unresolved"], [])
+        self.assertIn(_chunk(b"NAME", _s0("R_Hand")), out)
+
+    @unittest.skipUnless(os.path.isfile(CAR), "Inertia+ sample not found")
+    def test_real_weight_map_node(self):
+        """LightWave-saved car with a Weight Map node using map 'Weight':
+        rename it through an extra side pair and check the node follows."""
+        with open(CAR, "rb") as fh:
+            data = fh.read()
+        out, stats = lwo_mirror.mirror_bytes(data, pairs=[("Weight", "Mass")])
+        self.assertIn(("Weight", "Mass"), stats["renamed"])
+        self.assertGreaterEqual(stats["node_refs"], 1)
+        self.assertEqual(stats["unresolved"], [])
+        back, _ = lwo_mirror.mirror_bytes(out, pairs=[("Weight", "Mass")])
+        self.assertEqual(back, data[:8 + struct.unpack(">I", data[4:8])[0]])
 
 
 @unittest.skipUnless(SEEDS, "LWOFix seeds not found")
